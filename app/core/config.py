@@ -2,7 +2,6 @@
 from functools import lru_cache
 from typing import List
 
-from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,16 +27,24 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "sqlite+aiosqlite:///./naijasound.db"
 
-    # CORS
-    BACKEND_CORS_ORIGINS: List[str] = Field(
-        default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"]
-    )
+    # CORS — read as a raw string (comma-separated) and split via property below.
+    # pydantic-settings tries json.loads() on List[str] fields, which fails for
+    # "http://a,http://b", so we keep this as `str`.
+    BACKEND_CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
 
-    # AI Provider
-    AI_API_BASE_URL: str = "https://api.example.com/v1"
-    AI_API_KEY: str = "changeme"
-    AI_LYRICS_MODEL: str = "lyric-v1"
-    AI_MUSIC_MODEL: str = "eleven-music-v2"
+    # AI Provider — Tempolor (https://api.tempolor.com/open-apis/v1)
+    AI_API_BASE_URL: str = "https://api.tempolor.com/open-apis/v1"
+    AI_API_KEY: str = "Tempo-changeme"
+    # Eleven Music V2 — vocal or instrumental tracks (up to 5 min, 44.1kHz MP3/WAV)
+    AI_MUSIC_MODEL: str = "Eleven Music V2"
+    # Lyric v1 — lyrics from a theme/description
+    AI_LYRICS_MODEL: str = "Lyric v1"
+    # Tempolor models
+    AI_COVER_MODEL: str = "tempolor-latest"
+    AI_STEMS_MODEL: str = "Stems v2"
+    # Public URL Tempolor will POST back to when async generation finishes.
+    # Must be reachable from the internet — use ngrok/cloudflare tunnel for local dev.
+    AI_CALLBACK_URL: str = "https://yourdomin.com/music-gen/tempolor/callback"
 
     # Cloudinary
     CLOUDINARY_CLOUD_NAME: str = ""
@@ -49,12 +56,9 @@ class Settings(BaseSettings):
     FIRST_SUPERUSER_EMAIL: str = "admin@naijasound.ai"
     FIRST_SUPERUSER_PASSWORD: str = "ChangeMe123!"
 
-    @field_validator("BACKEND_CORS_ORIGINS", mode="before")
-    @classmethod
-    def _split_cors(cls, v):
-        if isinstance(v, str):
-            return [origin.strip() for origin in v.split(",") if origin.strip()]
-        return v
+    @property
+    def cors_origins(self) -> List[str]:
+        return [o.strip() for o in self.BACKEND_CORS_ORIGINS.split(",") if o.strip()]
 
 
 @lru_cache

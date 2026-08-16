@@ -10,7 +10,7 @@ from app.core.config import settings
 from app.core.database import AsyncSessionLocal, init_db
 from app.core.security import get_current_superuser, hash_password
 from app.models.models import User
-from app.routers import auth, songs, users
+from app.routers import auth, prompts, songs, users
 from app.schemas.schemas import UserRead
 
 logging.basicConfig(level=logging.INFO if not settings.DEBUG else logging.DEBUG)
@@ -64,7 +64,7 @@ app = FastAPI(
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.BACKEND_CORS_ORIGINS,
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -80,6 +80,7 @@ async def health() -> dict:
 app.include_router(auth.router, prefix=settings.API_V1_PREFIX)
 app.include_router(users.router, prefix=settings.API_V1_PREFIX)
 app.include_router(songs.router, prefix=settings.API_V1_PREFIX)
+app.include_router(prompts.router, prefix=settings.API_V1_PREFIX)
 
 
 # Re-export the superuser dep so it's importable elsewhere
