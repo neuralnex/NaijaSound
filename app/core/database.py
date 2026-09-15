@@ -23,8 +23,17 @@ if db_url.startswith("postgres://"):
 elif db_url.startswith("postgresql://"):
     db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
+# Add SSL support for remote Postgres (AWS/Heroku)
+connect_args = {}
+if "postgresql" in db_url:
+    # For asyncpg, ssl=True enables basic SSL.
+    # For some AWS RDS setups, you might need a more complex SSLContext,
+    # but this is the standard starting point.
+    connect_args = {"ssl": True}
+
 engine = create_async_engine(
     db_url,
+    connect_args=connect_args,
     echo=settings.DEBUG,
     future=True,
     pool_pre_ping=True,
