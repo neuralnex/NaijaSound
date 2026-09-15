@@ -20,6 +20,7 @@ class User(Base):
     is_superuser: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     avatar_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     credits: Mapped[int] = mapped_column(Integer, default=10, nullable=False)  # free starter credits
+    reserved_credits: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # ElevenLabs-style cloned voice id (set after user uploads a 30s sample).
     voice_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

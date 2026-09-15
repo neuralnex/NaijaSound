@@ -17,13 +17,25 @@ logging.basicConfig(level=logging.INFO if not settings.DEBUG else logging.DEBUG)
 logger = logging.getLogger("naijasound")
 
 
+import httpx
+
+from app.services.ai_service import ai_service
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown hooks."""
+    # Initialize singleton HTTP client for AI services
+    app.state.http_client = httpx.AsyncClient(timeout=120.0)
+    # Inject client into the AI service singleton
+    ai_service.client = app.state.http_client
+
     await init_db()
     await _bootstrap_superuser()
     logger.info("🚀 NaijaSound AI backend ready (env=%s)", settings.APP_ENV)
     yield
+
+    # Close client on shutdown
+    await app.state.http_client.aclose()
     logger.info("👋 NaijaSound shutting down")
 
 
@@ -69,6 +81,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/", tags=["meta"])
+async def root() -> dict:
+    return {"message": f"Welcome to {settings.APP_NAME} API", "docs": "/docs"}
 
 
 @app.get("/health", tags=["meta"])

@@ -25,6 +25,8 @@ def _configure() -> None:
     )
 
 
+from fastapi.concurrency import run_in_threadpool
+
 class CloudinaryService:
     def __init__(self) -> None:
         _configure()
@@ -33,7 +35,7 @@ class CloudinaryService:
     def _public_id_for(user_id: int, song_id: int, kind: str) -> str:
         return f"{settings.CLOUDINARY_FOLDER}/user_{user_id}/song_{song_id}/{kind}"
 
-    def upload_audio(
+    async def upload_audio(
         self,
         user_id: int,
         song_id: int,
@@ -44,7 +46,9 @@ class CloudinaryService:
         """Upload an audio track. `source` can be a remote URL or raw bytes."""
         public_id = self._public_id_for(user_id, song_id, "track")
         try:
-            result = cloudinary.uploader.upload(
+            # Wrap synchronous SDK call in threadpool to avoid blocking event loop
+            result = await run_in_threadpool(
+                cloudinary.uploader.upload,
                 source,
                 public_id=public_id,
                 resource_type=resource_type,
@@ -65,7 +69,7 @@ class CloudinaryService:
             "bytes": result.get("bytes"),
         }
 
-    def upload_cover(
+    async def upload_cover(
         self,
         user_id: int,
         song_id: int,
@@ -73,7 +77,8 @@ class CloudinaryService:
     ) -> dict[str, Any]:
         public_id = self._public_id_for(user_id, song_id, "cover")
         try:
-            result = cloudinary.uploader.upload(
+            result = await run_in_threadpool(
+                cloudinary.uploader.upload,
                 source,
                 public_id=public_id,
                 resource_type="image",
@@ -84,9 +89,14 @@ class CloudinaryService:
             raise CloudinaryError(str(exc)) from exc
         return {"url": result.get("secure_url"), "public_id": result.get("public_id")}
 
-    def delete(self, public_id: str, resource_type: str = "video") -> None:
+    async def delete(self, public_id: str, resource_type: str = "video") -> None:
         try:
-            cloudinary.uploader.destroy(public_id, resource_type=resource_type, invalidate=True)
+            await run_in_threadpool(
+                cloudinary.uploader.destroy,
+                public_id,
+                resource_type=resource_type,
+                invalidate=True,
+            )
         except Exception as exc:
             logger.warning("Cloudinary delete failed for %s: %s", public_id, exc)
 

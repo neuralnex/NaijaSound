@@ -40,6 +40,7 @@ STEMS_V3_CREDIT_COST = 15
 
 # Tempolor endpoints (relative to AI_API_BASE_URL).
 LYRICS_PATH = "/lyrics/generate"
+LYRICS_QUERY_PATH = "/lyrics/query"
 SONG_PATH = "/song/generate"
 COVER_PATH = "/song/cover"
 STEMS_PATH = "/stems"
@@ -59,11 +60,13 @@ class AIService:
         api_key: Optional[str] = None,
         callback_url: Optional[str] = None,
         timeout: float = 120.0,
+        client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         self.base_url = (base_url or settings.AI_API_BASE_URL).rstrip("/")
         self.api_key = api_key or settings.AI_API_KEY
         self.callback_url = callback_url or settings.AI_CALLBACK_URL
         self.timeout = timeout
+        self.client = client
 
     # ---------------- internal helpers ----------------
     def _headers(self) -> dict[str, str]:
@@ -77,68 +80,130 @@ class AIService:
 
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
+
+        # Use shared client if available, otherwise create a temporary one
+        if self.client:
+            client = self.client
+        else:
+            client = httpx.AsyncClient(timeout=self.timeout)
+
+        try:
+            if not self.client:
+                async with client:
+                    resp = await client.post(url, json=payload, headers=self._headers())
+            else:
                 resp = await client.post(url, json=payload, headers=self._headers())
-            except httpx.HTTPError as exc:
-                logger.exception("AI provider network error: %s", exc)
-                raise AIServiceError(f"AI provider unreachable: {exc}") from exc
+        except httpx.HTTPError as exc:
+            logger.exception("AI provider network error: %s", exc)
+            raise AIServiceError(f"AI provider unreachable: {exc}") from exc
+        finally:
+            # If we created a temporary client, it's already closed by the 'async with'
+            pass
 
-            if resp.status_code >= 400:
-                logger.error("AI provider %s -> %s: %s", url, resp.status_code, resp.text)
-                raise AIServiceError(
-                    f"AI provider returned {resp.status_code}: {resp.text[:500]}"
-                )
+        if resp.status_code >= 400:
+            logger.error("AI provider %s -> %s: %s", url, resp.status_code, resp.text)
+            raise AIServiceError(
+                f"AI provider returned {resp.status_code}: {resp.text[:500]}"
+            )
 
-            try:
-                return resp.json()
-            except ValueError as exc:
-                raise AIServiceError("AI provider returned non-JSON response") from exc
+        try:
+            return resp.json() or {}
+        except ValueError as exc:
+            logger.error("AI provider returned non-JSON response: %s", resp.text)
+            raise AIServiceError("AI provider returned non-JSON response") from exc
 
     # ---------------- public API ----------------
+    async def query_lyrics(
+        self,
+        item_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        """Poll for the results of a lyrics generation job."""
+        if not item_ids:
+            return []
+        payload = {"item_ids": item_ids}
+        data = await self._post(LYRICS_QUERY_PATH, payload)
+        # Use a helper to safely navigate nested dictionaries that might contain None
+        data_content = data.get("data") if isinstance(data, dict) else None
+        lyrics_list = data_content.get("lyrics", []) if isinstance(data_content, dict) else []
+        if isinstance(lyrics_list, dict):
+            lyrics_list = [lyrics_list]
+        # Filter out None values to prevent crashes in polling loop
+        return [item for item in lyrics_list if item is not None]
+
     async def generate_lyrics(
         self,
         theme: str,
         language_preset: str = "full-trilingual",
         custom_mix: Optional[str] = None,
         style_hint: Optional[str] = None,
+        poll_interval: float = 2.0,
+        poll_timeout: float = 60.0,
     ) -> str:
-        """Step 1: produce multilingual, structured lyrics via Tempolor."""
-        from app.schemas.language import resolve_language_preset
+        """Step 1: produce multilingual, structured lyrics via Tempolor (Async with polling)."""
+        try:
+            from app.schemas.language import resolve_language_preset
 
-        resolved = resolve_language_preset(language_preset, custom_mix)
+            resolved = resolve_language_preset(language_preset, custom_mix)
 
-        prompt_parts = [
-            f"Genre: Nigerian street music",
-            f"Languages to weave together: {resolved['mix']}",
-            f"Theme: {theme}",
-        ]
-        if style_hint or resolved.get("hint"):
-            hint = style_hint or resolved["hint"]
-            prompt_parts.append(f"Style: {hint}")
-        prompt_parts.append(
-            "Include structured [Intro], [Verse], [Chorus], [Bridge], [Outro] tags."
-        )
-
-        payload = {
-            "prompt": "\n".join(prompt_parts),
-            "song_model": settings.AI_LYRICS_MODEL,
-            "callback_url": self.callback_url,
-        }
-
-        data = await self._post(LYRICS_PATH, payload)
-        lyrics = (
-            data.get("lyrics")
-            or data.get("text")
-            or data.get("output")
-            or (data.get("data") or {}).get("lyrics")
-        )
-        if not lyrics:
-            raise AIServiceError(
-                "Lyrics endpoint returned no inline body "
-                f"(task_id={data.get('task_id') or data.get('id')})"
+            prompt_parts = [
+                f"Genre: Nigerian street music",
+                f"Languages to weave together: {resolved['mix']}",
+                f"Theme: {theme}",
+            ]
+            if style_hint or resolved.get("hint"):
+                hint = style_hint or resolved["hint"]
+                prompt_parts.append(f"Style: {hint}")
+            prompt_parts.append(
+                "Include structured [Intro], [Verse], [Chorus], [Bridge], [Outro] tags."
             )
-        return str(lyrics).strip()
+
+            payload = {
+                "prompt": "\n".join(prompt_parts),
+                "song_model": settings.AI_LYRICS_MODEL,
+                "callback_url": self.callback_url,
+            }
+
+            # 1. Submit task
+            data = await self._post(LYRICS_PATH, payload)
+            logger.info("AI Lyrics Submit Data: %s", data)
+
+            if data is None:
+                raise AIServiceError("AI provider returned None as response")
+
+            data_content = data.get("data") if isinstance(data, dict) else None
+            item_ids = data_content.get("item_ids") if isinstance(data_content, dict) else None
+            if not item_ids or not isinstance(item_ids, list):
+                raise AIServiceError(f"Lyrics submit returned no item_ids: {data}")
+
+            # 2. Poll for completion
+            import asyncio
+            elapsed = 0.0
+            while elapsed < poll_timeout:
+                logger.info("Polling lyrics for items: %s", item_ids)
+                results = await self.query_lyrics(item_ids)
+                logger.info("Polling results: %s", results)
+                if results:
+                    item = results[0]
+                    if item is None:
+                        logger.warning("First result item is None")
+                        continue
+                    status = (item.get("status") or "").lower()
+                    if status == "succeeded":
+                        lyrics = item.get("lyric")
+                        if lyrics:
+                            return str(lyrics).strip()
+                    if status == "failed":
+                        raise AIServiceError(f"Lyrics generation failed: {item}")
+
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+
+            raise AIServiceError(f"Lyrics generation timed out after {poll_timeout}s")
+        except AIServiceError:
+            raise
+        except Exception as e:
+            logger.exception("CRASH in generate_lyrics")
+            raise AIServiceError(f"Unexpected crash in AI service: {str(e)}")
 
     async def generate_song(
         self,
@@ -187,7 +252,7 @@ class AIService:
         data = await self._post(COVER_PATH, payload)
         return data
 
-    async def generate_full_track(
+    async def submit_full_track(
         self,
         theme: str,
         style: str,
@@ -195,96 +260,87 @@ class AIService:
         custom_mix: Optional[str] = None,
         user_lyrics: Optional[str] = None,
         duration_seconds: Optional[int] = None,
-    ) -> tuple[str, dict[str, Any], int]:
-        """Convenience: lyrics (auto or provided) → music. Returns (lyrics, audio, credits_used)."""
+        callback_url: Optional[str] = None,
+    ) -> None:
+        """Submit a request for a full track without polling for the result."""
         if user_lyrics and user_lyrics.strip():
             lyrics = user_lyrics.strip()
-            credits = MUSIC_CREDIT_COST
         else:
+            # We still need to generate lyrics synchronously as a first step
+            # because the music generation requires lyrics as input.
             lyrics = await self.generate_lyrics(
                 theme=theme,
                 language_preset=language_preset,
                 custom_mix=custom_mix,
             )
-            credits = LYRICS_CREDIT_COST + MUSIC_CREDIT_COST
 
         music_prompt = (
             f"{style.capitalize()} track about {theme}. "
             f"Groovy basslines, crisp percussion, polished 44.1kHz vocals."
         )
 
-        last_err: Optional[Exception] = None
-        for attempt in range(2):
-            try:
-                audio = await self.generate_song(
-                    prompt=music_prompt,
-                    lyrics=lyrics,
-                    duration_seconds=duration_seconds,
-                )
-                return lyrics, audio, credits
-            except AIServiceError as exc:
-                last_err = exc
-                await asyncio.sleep(2 ** attempt)
+        # Overwrite the default callback URL with the song-specific one
+        original_callback = self.callback_url
+        if callback_url:
+            self.callback_url = callback_url
 
-        raise AIServiceError(f"Music generation failed after retries: {last_err}")
+        try:
+            await self.generate_song(
+                prompt=music_prompt,
+                lyrics=lyrics,
+                duration_seconds=duration_seconds,
+            )
+        finally:
+            self.callback_url = original_callback
 
-    async def generate_instrumental(
+    async def submit_instrumental(
         self,
         theme: str,
         style: str,
         duration_seconds: Optional[int] = None,
-    ) -> tuple[dict[str, Any], int]:
-        """Convenience: instrumental-only music (no lyrics)."""
+        callback_url: Optional[str] = None,
+    ) -> None:
+        """Submit an instrumental request without polling."""
         music_prompt = (
             f"Instrumental {style} track about {theme}. "
             f"Groovy basslines, crisp percussion, polished 44.1kHz production."
         )
 
-        last_err: Optional[Exception] = None
-        for attempt in range(2):
-            try:
-                audio = await self.generate_song(
-                    prompt=music_prompt,
-                    instrumental=True,
-                    duration_seconds=duration_seconds,
-                )
-                return audio, MUSIC_CREDIT_COST
-            except AIServiceError as exc:
-                last_err = exc
-                await asyncio.sleep(2 ** attempt)
+        original_callback = self.callback_url
+        if callback_url:
+            self.callback_url = callback_url
 
-        raise AIServiceError(f"Instrumental generation failed after retries: {last_err}")
-
-    async def generate_cover_track(
-        self,
-        source_song: Any,  # Song model instance — duck-typed to avoid circular import
-        new_lyrics: Optional[str],
-        style: Optional[str],
-        theme: Optional[str],
-    ) -> tuple[str, dict[str, Any], int]:
-        """Convenience: cover a track the user owns."""
-        reference_url = source_song.audio_url
-        if not reference_url:
-            raise AIServiceError(
-                f"Source song {source_song.id} has no audio_url — cannot cover"
+        try:
+            await self.generate_song(
+                prompt=music_prompt,
+                instrumental=True,
+                duration_seconds=duration_seconds,
             )
+        finally:
+            self.callback_url = original_callback
 
-        last_err: Optional[Exception] = None
-        for attempt in range(2):
-            try:
-                audio = await self.generate_cover(
-                    reference_url=reference_url,
-                    new_lyrics=new_lyrics if new_lyrics is not None else source_song.lyrics,
-                    style=style or source_song.style,
-                    theme=theme or source_song.theme,
-                )
-                lyrics = new_lyrics if new_lyrics is not None else (source_song.lyrics or "")
-                return lyrics, audio, COVER_CREDIT_COST
-            except AIServiceError as exc:
-                last_err = exc
-                await asyncio.sleep(2 ** attempt)
+    async def submit_cover(
+        self,
+        reference_url: str,
+        new_lyrics: Optional[str] = None,
+        style: Optional[str] = None,
+        theme: Optional[str] = None,
+        callback_url: Optional[str] = None,
+    ) -> None:
+        """Submit a cover request without polling."""
+        original_callback = self.callback_url
+        if callback_url:
+            self.callback_url = callback_url
 
-        raise AIServiceError(f"Cover generation failed after retries: {last_err}")
+        try:
+            await self.generate_cover(
+                reference_url=reference_url,
+                new_lyrics=new_lyrics,
+                style=style,
+                theme=theme,
+            )
+        finally:
+            self.callback_url = original_callback
 
     async def submit_stems(
         self,
@@ -316,10 +372,16 @@ class AIService:
             return []
         payload = {"item_ids": item_ids[:10]}  # Tempolor caps at 10 per query
         data = await self._post(STEMS_QUERY_PATH, payload)
-        items = data.get("items") or data.get("data") or data
-        if isinstance(items, dict):
-            items = [items]
-        return items
+
+        # Robust navigation: data -> data -> stems (following the lyrics pattern)
+        data_content = data.get("data") if isinstance(data, dict) else None
+        stems_list = data_content.get("stems", []) if isinstance(data_content, dict) else []
+
+        if isinstance(stems_list, dict):
+            stems_list = [stems_list]
+
+        # Filter out None values to prevent crashes in the generate_stems polling loop
+        return [item for item in stems_list if item is not None]
 
     async def generate_stems(
         self,
