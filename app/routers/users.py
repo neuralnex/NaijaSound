@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db
 from app.core.security import get_current_user, hash_password
@@ -46,11 +47,14 @@ async def dashboard(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Lightweight dashboard summary for the home page."""
-    await db.execute(select(User).where(User.id == current_user.id))
+    result = await db.execute(
+        select(User).options(selectinload(User.songs)).where(User.id == current_user.id)
+    )
+    user_with_songs = result.scalar_one()
     return {
-        "user": UserRead.model_validate(current_user).model_dump(mode="json"),
-        "credits_remaining": current_user.credits,
-        "songs_count": len(current_user.songs),
+        "user": UserRead.model_validate(user_with_songs).model_dump(mode="json"),
+        "credits_remaining": user_with_songs.credits,
+        "songs_count": len(user_with_songs.songs),
     }
 
 
